@@ -61,6 +61,18 @@ class TestClientInit:
         assert client.base_url == "http://127.0.0.1:3000"
         assert client.ws_url == "ws://127.0.0.1:3000"
 
+    def test_client_https_urls(self):
+        client = Client(
+            server="https://example.trycloudflare.com",
+            port=443,
+            username="testuser",
+            password="testpassword",
+        )
+
+        assert client.server == "example.trycloudflare.com"
+        assert client.base_url == "https://example.trycloudflare.com:443"
+        assert client.ws_url == "wss://example.trycloudflare.com:443"
+
     def test_client_empty_password(self):
         client = Client("localhost", 8080, "user", None)
         assert client.password == b""
@@ -299,6 +311,101 @@ class TestReceiveLoop:
         assert len(client.users) == 1
         assert client.users[0]["user_id"] == "456"
 
+    @pytest.mark.asyncio
+    async def test_receive_user_joined(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+        client.users = [{"user_id": "123", "username": "user1"}]
+
+        joined_data = json.dumps(
+            {
+                "type": "user_joined",
+                "data": {"user_id": "456", "username": "user2"},
+            }
+        )
+
+        mock_ws = AsyncMock()
+        mock_ws.__aiter__.return_value = [joined_data]
+
+        with patch.object(client, "render_messages"):
+            await client.receive_loop(mock_ws)
+
+        assert len(client.users) == 2
+        assert client.users[1]["username"] == "user2"
+
+    @pytest.mark.asyncio
+    async def test_receive_duplicate_user_joined(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+        client.users = [{"user_id": "123", "username": "user1"}]
+
+        joined_data = json.dumps(
+            {
+                "type": "user_joined",
+                "data": {"user_id": "123", "username": "user1"},
+            }
+        )
+
+        mock_ws = AsyncMock()
+        mock_ws.__aiter__.return_value = [joined_data]
+
+        with patch.object(client, "render_messages"):
+            await client.receive_loop(mock_ws)
+
+        assert client.users == [{"user_id": "123", "username": "user1"}]
+
+    @pytest.mark.asyncio
+    async def test_receive_clear(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+        client.messages = [{"text": "old", "username": "user1"}]
+
+        clear_data = json.dumps({"type": "clear", "username": "user1"})
+
+        mock_ws = AsyncMock()
+        mock_ws.__aiter__.return_value = [clear_data]
+
+        with patch.object(client, "render_messages"), patch.object(client, "info"):
+            await client.receive_loop(mock_ws)
+
+        assert client.messages == []
+
+    @pytest.mark.asyncio
+    async def test_receive_rotate_updates_room_key(self, client):
+        old_key = Fernet.generate_key()
+        client.room_fernet = Fernet(old_key)
+        client.running = True
+        client.messages = [{"text": "old", "username": "user1"}]
+        new_salt = os.urandom(16)
+
+        rotate_data = json.dumps(
+            {
+                "type": "rotate",
+                "username": "user1",
+                "room_salt": base64.b64encode(new_salt).decode(),
+            }
+        )
+
+        mock_ws = AsyncMock()
+        mock_ws.__aiter__.return_value = [rotate_data]
+
+        with patch.object(client, "render_messages"), patch.object(client, "info"):
+            await client.receive_loop(mock_ws)
+
+        assert client.messages == []
+
+        plaintext = b"new-key-message"
+        encrypted = client.room_fernet.encrypt(plaintext)
+
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=new_salt,
+            info=b"cmd-chat-room-key",
+        )
+        expected_key = base64.urlsafe_b64encode(hkdf.derive(client.password))
+        assert Fernet(expected_key).decrypt(encrypted) == plaintext
+
 
 class TestInputLoop:
     @pytest.mark.asyncio
@@ -312,15 +419,44 @@ class TestInputLoop:
 
         inputs = iter(["hello", "q"])
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))):
             await client.input_loop(mock_ws)
 
         assert len(sent_messages) == 1
         decrypted = room_fernet.decrypt(sent_messages[0].encode()).decode()
         assert decrypted == "hello"
+
+    @pytest.mark.asyncio
+    async def test_send_clear_command(self, client, room_fernet):
+        client.room_fernet = room_fernet
+        client.running = True
+
+        mock_ws = AsyncMock()
+        sent_messages = []
+        mock_ws.send = AsyncMock(side_effect=lambda m: sent_messages.append(m))
+
+        inputs = iter(["/clear", "q"])
+
+        with patch.object(client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))):
+            await client.input_loop(mock_ws)
+
+        assert sent_messages == ["/clear"]
+
+    @pytest.mark.asyncio
+    async def test_send_rotate_command(self, client, room_fernet):
+        client.room_fernet = room_fernet
+        client.running = True
+
+        mock_ws = AsyncMock()
+        sent_messages = []
+        mock_ws.send = AsyncMock(side_effect=lambda m: sent_messages.append(m))
+
+        inputs = iter(["/rotate", "q"])
+
+        with patch.object(client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))):
+            await client.input_loop(mock_ws)
+
+        assert sent_messages == ["/rotate"]
 
     @pytest.mark.asyncio
     async def test_quit_command(self, client):
@@ -329,10 +465,7 @@ class TestInputLoop:
 
         mock_ws = AsyncMock()
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(return_value="quit")
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(client, "read_console_input", AsyncMock(return_value="quit")):
             await client.input_loop(mock_ws)
 
         assert client.running is False
@@ -345,10 +478,7 @@ class TestInputLoop:
         mock_ws = AsyncMock()
         inputs = iter(["", "   ", "q"])
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))):
             await client.input_loop(mock_ws)
 
         mock_ws.send.assert_not_called()

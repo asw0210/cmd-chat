@@ -2,6 +2,7 @@ from dataclasses import asdict
 
 import json
 import base64
+import os
 
 from sanic import Sanic, Request, response, Websocket
 from sanic.response import HTTPResponse, json as json_response
@@ -97,6 +98,18 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
 
     try:
         await send_state(ws, app)
+        await manager.broadcast(
+            json.dumps(
+                {
+                    "type": "user_joined",
+                    "data": {
+                        "user_id": user_id,
+                        "username": session.username,
+                    },
+                }
+            ),
+            exclude_user=user_id,
+        )
 
         async for data in ws:
             if data is None:
@@ -104,8 +117,35 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
 
             app.ctx.session_store.update_activity(user_id)
 
+            text = str(data)
+            if text.strip() == "/clear":
+                app.ctx.message_store.clear()
+                await manager.broadcast(
+                    json.dumps(
+                        {
+                            "type": "clear",
+                            "username": session.username,
+                        }
+                    )
+                )
+                continue
+
+            if text.strip() == "/rotate":
+                app.ctx.room_salt = os.urandom(16)
+                app.ctx.message_store.clear()
+                await manager.broadcast(
+                    json.dumps(
+                        {
+                            "type": "rotate",
+                            "username": session.username,
+                            "room_salt": base64.b64encode(app.ctx.room_salt).decode(),
+                        }
+                    )
+                )
+                continue
+
             message = Message(
-                text=str(data),
+                text=text,
                 user_ip=session.ip,
                 username=session.username,
             )

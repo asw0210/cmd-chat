@@ -1,7 +1,10 @@
 import asyncio
 import json
 import base64
+import queue
+import threading
 from typing import Optional
+from urllib.parse import urlparse
 
 import srp
 import requests
@@ -19,10 +22,15 @@ class Client:
     def __init__(
         self, server: str, port: int, username: str, password: Optional[str] = None
     ):
-        self.server = server
+        parsed = urlparse(server if "://" in server else f"//{server}")
+        scheme = parsed.scheme or "http"
+
+        self.server = parsed.netloc or parsed.path
         self.port = port
         self.username = username
         self.password = (password or "").encode()
+        self.http_scheme = "https" if scheme == "https" else "http"
+        self.ws_scheme = "wss" if self.http_scheme == "https" else "ws"
         self.user_id: Optional[str] = None
         self.fernet: Optional[Fernet] = None
         self.room_fernet: Optional[Fernet] = None
@@ -35,11 +43,11 @@ class Client:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.server}:{self.port}"
+        return f"{self.http_scheme}://{self.server}:{self.port}"
 
     @property
     def ws_url(self) -> str:
-        return f"ws://{self.server}:{self.port}"
+        return f"{self.ws_scheme}://{self.server}:{self.port}"
 
     def success(self, message: str) -> None:
         self.console.print(f"[green]✓ {message}[/]")
@@ -49,6 +57,16 @@ class Client:
 
     def info(self, message: str) -> None:
         self.console.print(f"[cyan]• {message}[/]")
+
+    def update_room_key(self, room_salt: bytes) -> None:
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=room_salt,
+            info=b"cmd-chat-room-key",
+        )
+        room_key = hkdf.derive(self.password)
+        self.room_fernet = Fernet(base64.urlsafe_b64encode(room_key))
 
     def srp_authenticate(self) -> None:
         with self.console.status("[cyan]Starting SRP handshake...[/]", spinner="dots"):
@@ -72,14 +90,7 @@ class Client:
             salt = base64.b64decode(init_data["salt"])
             room_salt = base64.b64decode(init_data["room_salt"])
 
-            hkdf = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=room_salt,
-                info=b"cmd-chat-room-key",
-            )
-            room_key = hkdf.derive(self.password)
-            self.room_fernet = Fernet(base64.urlsafe_b64encode(room_key))
+            self.update_room_key(room_salt)
 
             M = usr.process_challenge(salt, B)
 
@@ -164,6 +175,26 @@ class Client:
                     msg_data = self.decrypt_message(data.get("data", {}))
                     self.messages.append(msg_data)
                     self.render_messages()
+                elif msg_type == "user_joined":
+                    user = data.get("data", {})
+                    user_id = user.get("user_id")
+                    if user_id and not any(
+                        u.get("user_id") == user_id for u in self.users
+                    ):
+                        self.users.append(user)
+                    self.render_messages()
+                elif msg_type == "clear":
+                    username = data.get("username", "unknown")
+                    self.messages = []
+                    self.render_messages()
+                    self.info(f"Chat history cleared by {username}")
+                elif msg_type == "rotate":
+                    username = data.get("username", "unknown")
+                    room_salt = base64.b64decode(data["room_salt"])
+                    self.update_room_key(room_salt)
+                    self.messages = []
+                    self.render_messages()
+                    self.info(f"Room key rotated by {username}")
                 elif msg_type == "user_left":
                     left_id = data.get("user_id")
                     self.users = [u for u in self.users if u.get("user_id") != left_id]
@@ -172,17 +203,43 @@ class Client:
         except websockets.ConnectionClosed:
             self.connected = False
 
-    async def input_loop(self, ws) -> None:
-        loop = asyncio.get_event_loop()
+    async def read_console_input(self) -> str:
+        result: queue.Queue[str | BaseException] = queue.Queue(maxsize=1)
+
+        def read_input() -> None:
+            try:
+                result.put(input())
+            except BaseException as exc:
+                result.put(exc)
+
+        threading.Thread(target=read_input, daemon=True).start()
+
         while self.running:
             try:
-                text = await loop.run_in_executor(None, input)
+                value = result.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        raise asyncio.CancelledError
+
+    async def input_loop(self, ws) -> None:
+        while self.running:
+            try:
+                text = await self.read_console_input()
                 if text.lower() in ("q", "quit", "exit"):
                     self.running = False
                     break
                 if text.strip():
-                    encrypted = self.room_fernet.encrypt(text.encode()).decode()
-                    await ws.send(encrypted)
+                    if text.strip() in ("/clear", "/rotate"):
+                        await ws.send(text.strip())
+                    else:
+                        encrypted = self.room_fernet.encrypt(text.encode()).decode()
+                        await ws.send(encrypted)
             except (EOFError, KeyboardInterrupt):
                 self.running = False
                 break
@@ -198,7 +255,12 @@ class Client:
             self.info("Connecting to chat...")
             url = f"{self.ws_url}/ws/chat?user_id={self.user_id}"
 
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+            ) as ws:
                 self.success("Connected to chat server")
                 self.running = True
 
@@ -209,8 +271,10 @@ class Client:
                     [receive_task, input_task], return_when=asyncio.FIRST_COMPLETED
                 )
 
+                self.running = False
                 for task in pending:
                     task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
             self.console.print("\n[yellow]Disconnected[/]")
 

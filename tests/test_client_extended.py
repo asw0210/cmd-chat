@@ -414,10 +414,9 @@ class TestInputLoopExtended:
 
         mock_ws = AsyncMock()
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=KeyboardInterrupt())
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(
+            client, "read_console_input", AsyncMock(side_effect=KeyboardInterrupt())
+        ):
             await client.input_loop(mock_ws)
 
         assert client.running is False
@@ -429,10 +428,9 @@ class TestInputLoopExtended:
 
         mock_ws = AsyncMock()
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=EOFError())
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(
+            client, "read_console_input", AsyncMock(side_effect=EOFError())
+        ):
             await client.input_loop(mock_ws)
 
         assert client.running is False
@@ -444,10 +442,7 @@ class TestInputLoopExtended:
 
         mock_ws = AsyncMock()
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(return_value="exit")
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(client, "read_console_input", AsyncMock(return_value="exit")):
             await client.input_loop(mock_ws)
 
         assert client.running is False
@@ -460,10 +455,9 @@ class TestInputLoopExtended:
         mock_ws = AsyncMock()
         inputs = iter(["QUIT"])
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(
+            client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))
+        ):
             await client.input_loop(mock_ws)
 
         assert client.running is False
@@ -479,10 +473,9 @@ class TestInputLoopExtended:
 
         inputs = iter(["msg1", "msg2", "msg3", "q"])
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(
+            client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))
+        ):
             await client.input_loop(mock_ws)
 
         assert len(sent) == 3
@@ -498,10 +491,9 @@ class TestInputLoopExtended:
         mock_ws = AsyncMock()
         inputs = iter(["\t", "\n", "  \t  ", "q"])
 
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
+        with patch.object(
+            client, "read_console_input", AsyncMock(side_effect=lambda: next(inputs))
+        ):
             await client.input_loop(mock_ws)
 
         mock_ws.send.assert_not_called()
